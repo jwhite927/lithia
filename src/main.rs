@@ -2,44 +2,59 @@
 mod util;
 
 use crate::util::event::{Event, Events};
-use std::{error::Error, io, sync::{Mutex, Arc, mpsc::Sender}};
+use std::{error::Error, io, sync::{Mutex, Arc}, collections::HashMap};
 use termion::{event::Key, input::MouseTerminal, raw::IntoRawMode, screen::AlternateScreen};
 use tui::{
     backend::TermionBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Span, Spans, Text},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    // widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Terminal,
 };
 use unicode_width::UnicodeWidthStr;
-use mysql_async::prelude::*;
+use sqlx::mysql::{MySqlPoolOptions, MySqlPool};
 
 enum InputMode {
     Normal,
-    Editing,
+    EditingDb,
+    EditingQuery,
 }
 
-/// Model holds the state of the application
-struct Model {
-    /// Transmitting part of a channel
-    tx: Sender<Msg>,
-    /// Current value of the input box
-    input: String,
-    /// Current input mode
-    input_mode: InputMode,
-    /// History of recorded messages
-    messages: Vec<String>,
+enum DbStatus {
+    Connected,
+    Disconnected,
+}
 
+enum QueryStatus {
+    Waiting,
+    Complete,
+    NotStarted,
+}
+
+struct Model {
+    database_input: String,
+    query_input: String,
+    input_mode: InputMode,
+    db_status: DbStatus,
+    db_connection: Option<MySqlPool>,
+    query_status: QueryStatus,
+    messages: String,
 }
 
 impl Model {
-    fn new(tx: Sender<Msg>) -> Model {
+    fn new() -> Model {
         Model {
-            tx: tx,
-            input: String::new(),
+            // database_input: String::new(),
+            // query_input: String::new(),
+            database_input: "mysql://root:abc123@127.0.0.1:3307/lithia".to_string(),
+            query_input: "SELECT * FROM simple_table;".to_string(),
             input_mode: InputMode::Normal,
-            messages: Vec::new(),
+            db_status: DbStatus::Disconnected,
+            db_connection: None,
+            query_status: QueryStatus::NotStarted,
+            messages: String::new(),
         }
     }
 }
@@ -62,7 +77,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (tx, rx) = std::sync::mpsc::channel();
 
     // Create default app state
-    let mut model = Arc::new(Mutex::new(Model::new(tx)));
+    let model = Arc::new(Mutex::new(Model::new()));
 
     let cloned_model = Arc::clone(&model);
 
@@ -81,24 +96,30 @@ fn main() -> Result<(), Box<dyn Error>> {
                     [
                         Constraint::Length(1),
                         Constraint::Length(3),
+                        Constraint::Length(1),
+                        Constraint::Length(3),
                         Constraint::Min(1),
                     ]
                     .as_ref(),
                 )
                 .split(f.size());
 
-            let (input_msg, style) = match unlocked_model.input_mode {
-                InputMode::Normal => (
+            let (db_input_msg, db_style) = match unlocked_model.input_mode {
+                InputMode::Normal|InputMode::EditingQuery => (
                     vec![
                         Span::raw("Press "),
                         Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
                         Span::raw(" to exit, "),
-                        Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
-                        Span::raw(" to start editing."),
+                        Span::styled("s", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" to start editing. Status: "),
+                        match unlocked_model.db_status {
+                            DbStatus::Connected => Span::styled("Connected", Style::default().fg(Color::Green)),
+                            DbStatus::Disconnected => Span::styled("Disconnected", Style::default().fg(Color::Red)),
+                        },
                     ],
                     Style::default().add_modifier(Modifier::RAPID_BLINK),
                 ),
-                InputMode::Editing => (
+                InputMode::EditingDb => (
                     vec![
                         Span::raw("Press "),
                         Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
@@ -109,53 +130,100 @@ fn main() -> Result<(), Box<dyn Error>> {
                     Style::default(),
                 ),
             };
+            let mut db_help_text = Text::from(Spans::from(db_input_msg));
+            db_help_text.patch_style(db_style);
+            let help_message2 = Paragraph::new(db_help_text);
+            f.render_widget(help_message2, chunks[0]);
+
+            let db_input = Paragraph::new(unlocked_model.database_input.as_ref())
+                .style(match unlocked_model.input_mode {
+                    InputMode::Normal|InputMode::EditingQuery => Style::default(),
+                    InputMode::EditingDb => Style::default().fg(Color::Yellow),
+                })
+                .block(Block::default().borders(Borders::ALL).title("Input"));
+            f.render_widget(db_input, chunks[1]);
+
+            let (input_msg, style) = match unlocked_model.input_mode {
+                InputMode::Normal|InputMode::EditingDb => (
+                    vec![
+                        Span::raw("Press "),
+                        Span::styled("q", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" to exit, "),
+                        Span::styled("e", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" to start editing. Status: "),
+                        match unlocked_model.query_status {
+                            QueryStatus::Complete => Span::styled("Complete", Style::default().fg(Color::Green)),
+                            QueryStatus::Waiting => Span::styled("Waiting", Style::default().fg(Color::Yellow)),
+                            QueryStatus::NotStarted => Span::styled("Ready", Style::default()),
+                        }
+                    ],
+                    Style::default().add_modifier(Modifier::RAPID_BLINK),
+                ),
+                InputMode::EditingQuery => (
+                    vec![
+                        Span::raw("Press "),
+                        Span::styled("Esc", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" to stop editing, "),
+                        Span::styled("Enter", Style::default().add_modifier(Modifier::BOLD)),
+                        Span::raw(" to record the message"),
+                    ],
+                    Style::default(),
+                ),
+            };
+
             let mut text = Text::from(Spans::from(input_msg));
             text.patch_style(style);
             let help_message = Paragraph::new(text);
-            f.render_widget(help_message, chunks[0]);
+            f.render_widget(help_message, chunks[2]);
 
-            let input = Paragraph::new(unlocked_model.input.as_ref())
+            let input = Paragraph::new(unlocked_model.query_input.as_ref())
                 .style(match unlocked_model.input_mode {
-                    InputMode::Normal => Style::default(),
-                    InputMode::Editing => Style::default().fg(Color::Yellow),
+                    InputMode::Normal|InputMode::EditingDb => Style::default(),
+                    InputMode::EditingQuery => Style::default().fg(Color::Yellow),
                 })
                 .block(Block::default().borders(Borders::ALL).title("Input"));
-            f.render_widget(input, chunks[1]);
+            f.render_widget(input, chunks[3]);
             match unlocked_model.input_mode {
                 InputMode::Normal =>
                     // Hide the cursor. `Frame` does this by default, so we don't need to do anything here
                     {}
 
-                InputMode::Editing => {
+                InputMode::EditingQuery => {
                     // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
                     f.set_cursor(
                         // Put cursor past the end of the input text
-                        chunks[1].x + unlocked_model.input.width() as u16 + 1,
+                        chunks[3].x + unlocked_model.query_input.width() as u16 + 1,
+                        // Move one line down, from the border to the input line
+                        chunks[3].y + 1,
+                    )
+                }
+                InputMode::EditingDb => {
+                    // Make the cursor visible and ask tui-rs to put it at the specified coordinates after rendering
+                    f.set_cursor(
+                        // Put cursor past the end of the input text
+                        chunks[1].x + unlocked_model.database_input.width() as u16 + 1,
                         // Move one line down, from the border to the input line
                         chunks[1].y + 1,
                     )
                 }
             }
 
-            // let messages: Vec<ListItem> = results
+
+            // let messages: Vec<ListItem> = unlocked_model
+            //     .messages
             //     .iter()
-            //     .map(|i| {
-            //         let content = vec![Spans::from(Span::raw(format!("{}", i)))];
+            //     .enumerate()
+            //     .map(|(i, m)| {
+            //         let content = vec![Spans::from(Span::raw(format!("{}: {}", i, m)))];
             //         ListItem::new(content)
             //     })
             //     .collect();
-            let messages: Vec<ListItem> = unlocked_model
-                .messages
-                .iter()
-                .enumerate()
-                .map(|(i, m)| {
-                    let content = vec![Spans::from(Span::raw(format!("{}: {}", i, m)))];
-                    ListItem::new(content)
-                })
-                .collect();
-            let messages =
-                List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
-            f.render_widget(messages, chunks[2]);
+            // let messages =
+            //     List::new(messages).block(Block::default().borders(Borders::ALL).title("Messages"));
+            let messages = Paragraph::new(unlocked_model.messages.clone())
+                .block(Block::default().borders(Borders::ALL).title("Results"))
+                .wrap(Wrap { trim: false });
+            f.render_widget(messages, chunks[4]);
         })?;
 
         // Handle input
@@ -163,29 +231,49 @@ fn main() -> Result<(), Box<dyn Error>> {
             match unlocked_model.input_mode {
                 InputMode::Normal => match input {
                     Key::Char('e') => {
-                        unlocked_model.input_mode = InputMode::Editing;
+                        unlocked_model.input_mode = InputMode::EditingQuery;
                         events.disable_exit_key();
                     }
-                    Key::Char('w') => {
-                        unlocked_model.tx.send(Msg::GetQuery).unwrap();
+                    Key::Char('s') => {
+                        unlocked_model.input_mode = InputMode::EditingDb;
+                        events.disable_exit_key();
                     }
                     Key::Char('q') => {
                         break;
                     }
                     _ => {}
                 },
-                InputMode::Editing => match input {
+                InputMode::EditingQuery => match input {
                     Key::Char('\n') => {
-                        // unlocked_model.messages.push(unlocked_model.input.drain(..).collect());
+                        tx.send(Msg::Query(unlocked_model.query_input.drain(..).collect(), unlocked_model.database_input.clone()))?;
+                        unlocked_model.input_mode = InputMode::Normal;
+                        unlocked_model.query_status = QueryStatus::Waiting;
                     }
-                    Key::Char(_c) => {
-                        // unlocked_model.input.push(c);
+                    Key::Char(c) => {
+                        unlocked_model.query_input.push(c);
                     }
                     Key::Backspace => {
-                        // unlocked_model.input.pop();
+                        unlocked_model.query_input.pop();
                     }
                     Key::Esc => {
-                        // unlocked_model.input_mode = InputMode::Normal;
+                        unlocked_model.input_mode = InputMode::Normal;
+                        events.enable_exit_key();
+                    }
+                    _ => {}
+                },
+                InputMode::EditingDb => match input {
+                    Key::Char('\n') => {
+                        tx.send(Msg::Connect(unlocked_model.database_input.clone()))?;
+                        unlocked_model.input_mode = InputMode::Normal;
+                    }
+                    Key::Char(c) => {
+                        unlocked_model.database_input.push(c);
+                    }
+                    Key::Backspace => {
+                        unlocked_model.database_input.pop();
+                    }
+                    Key::Esc => {
+                        unlocked_model.input_mode = InputMode::Normal;
                         events.enable_exit_key();
                     }
                     _ => {}
@@ -196,32 +284,43 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+// Msg defines what can be done with Databases
 pub enum Msg {
-    GetQuery,
+    Query(String, String),
+    Connect(String),
     None
 }
 
 
-// Acts as Update
+// Acts as Update Function for DB Activities
 #[tokio::main]
-async fn start_tokio(model: &Arc<Mutex<Model>>, io_rx: std::sync::mpsc::Receiver<Msg>) -> Result<(), mysql_async::Error> {
-    let database_opts = mysql_async::OptsBuilder::default()
-        .ip_or_hostname("localhost")
-        .db_name(Some("mig_dest"))
-        .tcp_port(3307)
-        .user(Some("root"))
-        .pass(Some("abc123"));
+async fn start_tokio(model: &Arc<Mutex<Model>>, io_rx: std::sync::mpsc::Receiver<Msg>) -> Result<(), sqlx::Error> {
 
-    let pool = mysql_async::Pool::new(database_opts);
-    let mut conn = pool.get_conn().await?;
+    // let pool = sqlx::mysql::MySqlPoolOptions::new()
+    //     .max_connections(5_u32)
+    //     .connect("mysql://root:abc123@127.0.0.1:3307/lithia").await?;
 
     while let Ok(msg) = io_rx.recv() {
         match msg {
-            Msg::GetQuery => {
-                // let results = conn.query("SELECT * FROM tbl_asset LIMIT 3").await;
+            Msg::Query(query, uri) => {
+                while let Ok(mut model) = model.lock() {
+                    model.messages = "Sending query".to_string();
+                }
+                let results: String = format!("{:?}", sqlx::query(&query).fetch_one(match model.db_connection {
+                    Some(pool) => pool,
+                    None => panic!("No pool found"),
+                }).await?);
 
                 while let Ok(mut model) = model.lock() {
-                    model.messages = vec!["Ok".to_string()];
+                    model.messages = results.clone();
+                    model.query_status = QueryStatus::Complete;
+                }
+            }
+            Msg::Connect(uri) => {
+                let pool = MySqlPoolOptions::new().connect(&uri).await?;
+                while let Ok(mut model) = model.lock() {
+                    model.db_connection = Some(pool);
+                    model.db_status = DbStatus::Connected;
                 }
             }
             Msg::None => {}
