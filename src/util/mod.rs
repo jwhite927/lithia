@@ -2,6 +2,7 @@ pub mod event;
 
 use rand::distributions::{Distribution, Uniform};
 use rand::rngs::ThreadRng;
+use std::fmt;
 use tui::widgets::ListState;
 
 #[derive(Clone)]
@@ -126,5 +127,39 @@ impl<T> StatefulList<T> {
 
     pub fn unselect(&mut self) {
         self.state.select(None);
+    }
+}
+
+#[derive(Debug)]
+pub struct Password {
+    value: String,
+    visible: bool,
+}
+
+impl Password {
+    pub fn from(password: &str) -> Password {
+        Password {
+            value: password.to_string(),
+            visible: false,
+        }
+    }
+    pub fn toggle(&mut self) {
+        self.visible = !self.visible
+    }
+}
+
+impl fmt::Display for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.visible {
+            write!(f, "{}", self.value)
+        } else {
+            write!(
+                f,
+                "{}",
+                (0..self.value.len())
+                    .map(|_| '\u{25CF}')
+                    .collect::<String>()
+            )
+        }
     }
 }
